@@ -15,7 +15,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "2.34", default-features = false }
 futures-util = "0.3"
-hyper-rustls = "0.23"
+hyper-rustls = "0.27"
 log = "0.4"
 pretty_env_logger = "0.4"
 reqwest = { version = "0.11", default-features = false, features = [
@@ -23,7 +23,7 @@ reqwest = { version = "0.11", default-features = false, features = [
     "stream",
 ] }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.15", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal"] }
 url = "2.2"
 warp = "0.3"
 
