@@ -1,6 +1,5 @@
 use log::trace;
 use reqwest::Client;
-use warp::http::header::SET_COOKIE;
 use warp::http::request::Parts;
 use warp::hyper::{self, Body, Response};
 
@@ -33,8 +32,8 @@ impl HttpsClient {
         let body = reqwest::Body::wrap_stream(body);
         let request = self
             .client
-            .request(method, url)
-            .headers(headers)
+            .request(to_reqwest_method(&method), url)
+            .headers(to_reqwest_headers(&headers))
             .body(body)
             .build()?;
 
@@ -42,21 +41,41 @@ impl HttpsClient {
         let response = self.client.execute(request).await?;
         trace!("Got response");
 
-        // Have to assign SET_COOKIE to a local variable here to avoid
-        // https://github.com/rust-lang/rust-clippy/issues/3825
-        let set_cookie = SET_COOKIE;
-        let response_headers = response.headers().iter().filter(|(k, _)| k != &set_cookie);
+        let response_headers = response
+            .headers()
+            .iter()
+            .filter(|(k, _)| k != &reqwest::header::SET_COOKIE);
 
         let mut builder = Response::builder();
 
         for (key, value) in response_headers {
-            builder = builder.header(key, value);
+            builder = builder.header(key.as_str(), value.as_bytes());
         }
 
         let response = builder
-            .status(response.status())
+            .status(response.status().as_u16())
             .body(Body::wrap_stream(response.bytes_stream()))?;
 
         Ok(response)
     }
+}
+
+/// Convert a `warp`/`http` 0.2 method into the `http` 1.0 method used by `reqwest`.
+fn to_reqwest_method(method: &warp::http::Method) -> reqwest::Method {
+    reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .expect("a valid method is always a valid method")
+}
+
+/// Convert a `warp`/`http` 0.2 header map into the `http` 1.0 map used by `reqwest`.
+fn to_reqwest_headers(headers: &warp::http::HeaderMap) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        if let (Ok(key), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            out.append(key, value);
+        }
+    }
+    out
 }
