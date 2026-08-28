@@ -14,7 +14,7 @@
 //! address just as well as through `127.0.0.1`.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 
 use log::error;
 
@@ -25,60 +25,12 @@ const PROBE_PORT: u16 = 0;
 /// Port paired with a hostname for resolution. Any port resolves the same name.
 const RESOLVE_PORT: u16 = 80;
 
-/// Ranges that always name this host, whatever interfaces it has.
-const BLOCKED_IPV4_CIDRS: &[(Ipv4Addr, u32)] = &[
-    (Ipv4Addr::new(0, 0, 0, 0), 8),   // this host / this network
-    (Ipv4Addr::new(127, 0, 0, 0), 8), // loopback
-];
-
-/// IPv6 counterparts of the ranges above.
-const BLOCKED_IPV6_CIDRS: &[(Ipv6Addr, u32)] = &[
-    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128), // unspecified
-    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128), // loopback
-];
-
-fn matches_prefix(address: &[u8], network: &[u8], prefix_length: u32) -> bool {
-    let full_bytes = (prefix_length / 8) as usize;
-    if address[..full_bytes] != network[..full_bytes] {
-        return false;
-    }
-
-    let remaining_bits = prefix_length % 8;
-    if remaining_bits == 0 {
-        return true;
-    }
-
-    let mask = 0xffu8 << (8 - remaining_bits);
-    address[full_bytes] & mask == network[full_bytes] & mask
-}
-
-fn is_loopback_ipv4(address: Ipv4Addr) -> bool {
-    BLOCKED_IPV4_CIDRS.iter().any(|(network, prefix_length)| {
-        matches_prefix(&address.octets(), &network.octets(), *prefix_length)
-    })
-}
-
-fn is_loopback_ipv6(address: Ipv6Addr) -> bool {
-    // An IPv4-mapped ::ffff:a.b.c.d or the deprecated IPv4-compatible ::a.b.c.d
-    // both carry in their low 32 bits the address that is actually connected to.
-    if let Some(mapped) = address.to_ipv4_mapped() {
-        return is_loopback_ipv4(mapped);
-    }
-    if let Some(compatible) = address.to_ipv4() {
-        return is_loopback_ipv4(compatible);
-    }
-
-    BLOCKED_IPV6_CIDRS.iter().any(|(network, prefix_length)| {
-        matches_prefix(&address.octets(), &network.octets(), *prefix_length)
-    })
-}
-
-/// True when an address names this host outright, before any interface is
-/// considered.
-fn is_loopback_address(address: IpAddr) -> bool {
+/// Unwraps ::ffff:a.b.c.d to the v4 address actually connected to, so the
+/// std predicates below see it.
+fn unmapped(address: IpAddr) -> IpAddr {
     match address {
-        IpAddr::V4(address) => is_loopback_ipv4(address),
-        IpAddr::V6(address) => is_loopback_ipv6(address),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        address => address,
     }
 }
 
@@ -88,22 +40,16 @@ fn is_loopback_address(address: IpAddr) -> bool {
 /// of the local interfaces, which answers the question without enumerating them
 /// and without going stale when a lease changes. A kernel configured with
 /// `ip_nonlocal_bind` would let any address bind and make this always true, so
-/// the loopback ranges are checked separately rather than relying on this alone.
+/// loopback is checked separately rather than relying on this alone.
 fn is_device_address(address: IpAddr) -> bool {
-    let mapped = match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map_or(IpAddr::V6(address), IpAddr::V4),
-        address => address,
-    };
-
-    UdpSocket::bind(SocketAddr::new(mapped, PROBE_PORT)).is_ok()
+    UdpSocket::bind(SocketAddr::new(address, PROBE_PORT)).is_ok()
 }
 
 /// True when a proxied request must not reach this address: it is loopback, or
 /// it is one the device itself answers on.
 pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
-    is_loopback_address(address) || is_device_address(address)
+    let address = unmapped(address);
+    address.is_loopback() || address.is_unspecified() || is_device_address(address)
 }
 
 /// Returns the reason a URL must not be fetched, or `None` when it may be.
