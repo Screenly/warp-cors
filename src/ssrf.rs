@@ -12,17 +12,11 @@
 //! is out of bounds, which means loopback and every address the device answers
 //! on — a service bound to `0.0.0.0` is reachable through the device's own LAN
 //! address just as well as through `127.0.0.1`.
-//!
-//! Set `BLOCK_LOCAL_ADDRESSES` to `false` where the proxy is meant to reach the
-//! device, such as a test world serving its own origin.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::OnceLock;
 
 use log::error;
-
-const BLOCK_LOCAL_ADDRESSES_VAR: &str = "BLOCK_LOCAL_ADDRESSES";
 
 /// Port used only to turn a hostname into something resolvable, and to probe
 /// whether an address belongs to the device; the address is what matters.
@@ -112,17 +106,6 @@ pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
     is_loopback_address(address) || is_device_address(address)
 }
 
-/// Read once: the setting cannot change under a running proxy, and the check
-/// runs on every request and every name the client resolves.
-fn blocking_local_addresses() -> bool {
-    static BLOCKING: OnceLock<bool> = OnceLock::new();
-    *BLOCKING.get_or_init(|| {
-        std::env::var(BLOCK_LOCAL_ADDRESSES_VAR)
-            .map(|value| value != "false")
-            .unwrap_or(true)
-    })
-}
-
 /// Returns the reason a URL must not be fetched, or `None` when it may be.
 ///
 /// A literal address is decided without a lookup; a hostname is resolved and no
@@ -134,16 +117,8 @@ fn blocking_local_addresses() -> bool {
 /// This resolves names with the blocking resolver, so callers on an async
 /// runtime should reach for [`blocked_url_reason_async`].
 pub(crate) fn blocked_url_reason(url: &url::Url) -> Option<String> {
-    blocked_url_reason_when(url, blocking_local_addresses())
-}
-
-fn blocked_url_reason_when(url: &url::Url, blocking: bool) -> Option<String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Some(format!("Target scheme is not allowed: {url}"));
-    }
-
-    if !blocking {
-        return None;
     }
 
     let host = url.host()?;
@@ -192,7 +167,6 @@ impl reqwest::dns::Resolve for PublicAddressResolver {
         let host = name.as_str().to_owned();
 
         Box::pin(async move {
-            let blocking = blocking_local_addresses();
             let resolved = tokio::task::spawn_blocking(move || {
                 (host.as_str(), RESOLVE_PORT)
                     .to_socket_addrs()
@@ -200,10 +174,9 @@ impl reqwest::dns::Resolve for PublicAddressResolver {
             })
             .await??;
 
-            if blocking
-                && resolved
-                    .iter()
-                    .any(|address| is_blocked_address(address.ip()))
+            if resolved
+                .iter()
+                .any(|address| is_blocked_address(address.ip()))
             {
                 error!("Refusing to resolve a host that names this device");
                 return Err(Box::new(DeviceAddress) as Box<dyn std::error::Error + Send + Sync>);
@@ -302,7 +275,7 @@ mod tests {
 
     #[test]
     fn blocked_url_reason_when_loopback_literal_should_refuse() {
-        let reason = blocked_url_reason_when(&parse("http://127.0.0.1:4040/api/v3/screens/"), true);
+        let reason = blocked_url_reason(&parse("http://127.0.0.1:4040/api/v3/screens/"));
 
         assert_eq!(
             reason,
@@ -314,7 +287,7 @@ mod tests {
 
     #[test]
     fn blocked_url_reason_when_ipv6_loopback_literal_should_refuse() {
-        let reason = blocked_url_reason_when(&parse("http://[::1]:3030/"), true);
+        let reason = blocked_url_reason(&parse("http://[::1]:3030/"));
 
         assert_eq!(
             reason,
@@ -326,26 +299,7 @@ mod tests {
 
     #[test]
     fn blocked_url_reason_when_scheme_is_not_http_should_refuse() {
-        let reason = blocked_url_reason_when(&parse("file:///etc/passwd"), true);
-
-        assert_eq!(
-            reason,
-            Some(String::from(
-                "Target scheme is not allowed: file:///etc/passwd"
-            ))
-        );
-    }
-
-    #[test]
-    fn blocked_url_reason_when_not_blocking_should_allow_loopback() {
-        let reason = blocked_url_reason_when(&parse("http://127.0.0.1:4040/"), false);
-
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn blocked_url_reason_when_not_blocking_should_still_refuse_a_bad_scheme() {
-        let reason = blocked_url_reason_when(&parse("file:///etc/passwd"), false);
+        let reason = blocked_url_reason(&parse("file:///etc/passwd"));
 
         assert_eq!(
             reason,
@@ -357,7 +311,7 @@ mod tests {
 
     #[test]
     fn blocked_url_reason_when_public_literal_should_allow() {
-        let reason = blocked_url_reason_when(&parse("https://93.184.216.34/index.html"), true);
+        let reason = blocked_url_reason(&parse("https://93.184.216.34/index.html"));
 
         assert_eq!(reason, None);
     }
