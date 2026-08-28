@@ -16,7 +16,7 @@ struct ErrorMessage {
 pub(crate) async fn recover(err: Rejection) -> Result<impl Reply, Rejection> {
     if let Some(ref err) = err.find::<Error>() {
         let error = ErrorMessage {
-            code: 500,
+            code: err.status_code(),
             message: err.to_string(),
         };
 
@@ -33,12 +33,25 @@ pub(crate) async fn recover(err: Rejection) -> Result<impl Reply, Rejection> {
 
 #[derive(Debug)]
 pub(crate) enum Error {
+    /// The caller asked for a target that is not allowed to be fetched.
+    BlockedTarget(String),
     Http(http::Error),
     Hyper(hyper::Error),
     InvalidHeaderValue(hyper::header::InvalidHeaderValue),
     Io(io::Error),
     Reqwest(reqwest::Error),
+    TooManyRedirects,
     UrlParse(url::ParseError),
+}
+
+impl Error {
+    /// A refused target is the caller's fault; everything else is ours.
+    fn status_code(&self) -> u16 {
+        match self {
+            Error::BlockedTarget(_) => 403,
+            _ => 500,
+        }
+    }
 }
 
 impl std::error::Error for Error {}
@@ -46,11 +59,13 @@ impl std::error::Error for Error {}
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Error::BlockedTarget(reason) => write!(f, "{reason}"),
             Error::Http(err) => err.fmt(f),
             Error::Hyper(err) => err.fmt(f),
             Error::InvalidHeaderValue(err) => err.fmt(f),
             Error::Io(err) => err.fmt(f),
             Error::Reqwest(err) => err.fmt(f),
+            Error::TooManyRedirects => write!(f, "Target redirected too many times"),
             Error::UrlParse(err) => err.fmt(f),
         }
     }

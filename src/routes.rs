@@ -77,6 +77,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_when_target_is_loopback_should_refuse() {
+        let routes = routes("warp-cors".to_owned());
+
+        let response = warp::test::request()
+            .method("GET")
+            .header("origin", "http://127.0.0.1:34567")
+            .path("/http://127.0.0.1:4040/api/v3/screens/")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn proxy_when_target_is_a_private_address_should_refuse() {
+        let routes = routes("warp-cors".to_owned());
+
+        let response = warp::test::request()
+            .method("GET")
+            .header("origin", "http://127.0.0.1:34567")
+            .path("/http://192.168.1.10/")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), 403);
+    }
+
+    #[tokio::test]
     async fn test_preflight() {
         let preflight = preflight();
 

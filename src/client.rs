@@ -1,9 +1,10 @@
-use log::trace;
-use reqwest::Client;
+use log::{error, trace};
+use reqwest::{redirect, Client};
 use warp::http::request::Parts;
 use warp::hyper::{self, Body, Response};
 
 use crate::error;
+use crate::ssrf;
 
 pub type Request = hyper::Request<Body>;
 
@@ -12,9 +13,34 @@ pub(crate) struct HttpsClient {
     client: Client,
 }
 
+/// Matches reqwest's own default depth, kept explicit because the policy below
+/// replaces that default.
+const MAX_REDIRECTS: usize = 10;
+
 impl HttpsClient {
     pub(crate) fn new() -> Self {
-        let client = Client::new();
+        // Checking only the URL the caller asked for would leave a public host
+        // free to redirect the proxy to a loopback or private address, so every
+        // hop is vetted as reqwest follows it. The check runs on the thread
+        // reqwest calls the policy from, which is why it is the blocking one.
+        let redirect_policy = redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error(error::Error::TooManyRedirects);
+            }
+
+            match ssrf::blocked_url_reason(attempt.url()) {
+                Some(reason) => {
+                    error!("Refusing to follow redirect: {}", reason);
+                    attempt.error(error::Error::BlockedTarget(reason))
+                }
+                None => attempt.follow(),
+            }
+        });
+
+        let client = Client::builder()
+            .redirect(redirect_policy)
+            .build()
+            .expect("HTTP client should build");
         HttpsClient { client }
     }
 
