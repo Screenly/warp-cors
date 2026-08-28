@@ -18,12 +18,12 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 
 use log::error;
 
-/// Port used only to turn a hostname into something resolvable, and to probe
-/// whether an address belongs to the device; the address is what matters.
-const PROBE_PORT: u16 = 0;
-
-/// Port paired with a hostname for resolution. Any port resolves the same name.
-const RESOLVE_PORT: u16 = 80;
+/// Only the address matters here, never the port: it pairs with a hostname to
+/// resolve it, and with an address to probe whether the device owns it. It has
+/// to stay zero in what the resolver hands back, because that is the value the
+/// HTTP client replaces with the port the scheme calls for - hand back 80 and
+/// an https request connects to port 80.
+const ANY_PORT: u16 = 0;
 
 /// Unwraps ::ffff:a.b.c.d to the v4 address actually connected to, so the
 /// std predicates below see it.
@@ -42,7 +42,7 @@ fn unmapped(address: IpAddr) -> IpAddr {
 /// `ip_nonlocal_bind` would let any address bind and make this always true, so
 /// loopback is checked separately rather than relying on this alone.
 fn is_device_address(address: IpAddr) -> bool {
-    UdpSocket::bind(SocketAddr::new(address, PROBE_PORT)).is_ok()
+    UdpSocket::bind(SocketAddr::new(address, ANY_PORT)).is_ok()
 }
 
 /// True when a proxied request must not reach this address: it is loopback, or
@@ -76,7 +76,7 @@ pub(crate) fn blocked_url_reason(url: &url::Url) -> Option<String> {
     let addresses: Vec<IpAddr> = match host {
         url::Host::Ipv4(address) => vec![IpAddr::V4(address)],
         url::Host::Ipv6(address) => vec![IpAddr::V6(address)],
-        url::Host::Domain(domain) => match (domain, RESOLVE_PORT).to_socket_addrs() {
+        url::Host::Domain(domain) => match (domain, ANY_PORT).to_socket_addrs() {
             Ok(resolved) => resolved.map(|address| address.ip()).collect(),
             Err(_) => return Some(format!("Target host does not resolve: {url}")),
         },
@@ -118,7 +118,7 @@ impl reqwest::dns::Resolve for PublicAddressResolver {
 
         Box::pin(async move {
             let resolved = tokio::task::spawn_blocking(move || {
-                (host.as_str(), RESOLVE_PORT)
+                (host.as_str(), ANY_PORT)
                     .to_socket_addrs()
                     .map(|addresses| addresses.collect::<Vec<_>>())
             })
