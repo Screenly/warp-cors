@@ -49,7 +49,11 @@ fn is_device_address(address: IpAddr) -> bool {
 /// it is one the device itself answers on.
 pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
     let address = unmapped(address);
-    address.is_loopback() || address.is_unspecified() || is_device_address(address)
+    // All of 0.0.0.0/8 means this host, but only 0.0.0.0 itself is unspecified.
+    address.is_loopback()
+        || address.is_unspecified()
+        || matches!(address, IpAddr::V4(v4) if v4.octets()[0] == 0)
+        || is_device_address(address)
 }
 
 /// Returns the reason a URL must not be fetched, or `None` when it may be.
@@ -167,6 +171,11 @@ mod tests {
     #[test]
     fn is_blocked_address_when_unspecified_should_block() {
         assert!(is_blocked_address("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_blocked_address_when_in_this_host_range_should_block() {
+        assert!(is_blocked_address("0.1.2.3".parse().unwrap()));
     }
 
     #[test]
