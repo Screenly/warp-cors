@@ -91,13 +91,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_when_target_is_a_private_address_should_refuse() {
+    async fn proxy_when_target_is_ipv6_loopback_should_refuse() {
         let routes = routes("warp-cors".to_owned());
 
         let response = warp::test::request()
             .method("GET")
             .header("origin", "http://127.0.0.1:34567")
-            .path("/http://192.168.1.10/")
+            .path("/http://[::1]:3030/")
             .reply(&routes)
             .await;
 

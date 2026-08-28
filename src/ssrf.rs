@@ -1,61 +1,46 @@
-//! Refuses proxy targets that point at non-public addresses.
+//! Refuses proxy targets that point back at the device running the proxy.
 //!
 //! Every target this proxy fetches comes from the caller, and on a Screenly
-//! player the caller is web content rendered by the viewer. Without a check,
-//! any page can ask the proxy to fetch a loopback service — the identity proxy
-//! hands out the device's credentials — or sweep the network the player sits
-//! on, and read the answer, because the response comes back with the caller's
-//! origin allowed and credentials exposed.
+//! player the caller is web content rendered by the viewer. A page that names a
+//! loopback target reaches services meant for the device alone — the identity
+//! proxy answers with the device's credentials — and it can read the answer,
+//! because the response comes back with the caller's origin allowed and every
+//! header exposed.
 //!
-//! The blocked ranges mirror the SSRF filter the screenshoter uses, so both
-//! services agree on what "not public" means. Set `BLOCK_PRIVATE_ADDRESSES` to
-//! `false` where the proxy is meant to reach internal hosts, such as a test
-//! world serving its own origin.
+//! Reaching the rest of the network stays allowed: a player sits on a customer
+//! network and content legitimately fetches hosts there. Only the device itself
+//! is out of bounds, which means loopback and every address the device answers
+//! on — a service bound to `0.0.0.0` is reachable through the device's own LAN
+//! address just as well as through `127.0.0.1`.
+//!
+//! Set `BLOCK_LOCAL_ADDRESSES` to `false` where the proxy is meant to reach the
+//! device, such as a test world serving its own origin.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::OnceLock;
 
-const BLOCK_PRIVATE_ADDRESSES_VAR: &str = "BLOCK_PRIVATE_ADDRESSES";
+use log::error;
 
-/// Port used only to turn a hostname into something resolvable; the address is
-/// what matters, never the port.
+const BLOCK_LOCAL_ADDRESSES_VAR: &str = "BLOCK_LOCAL_ADDRESSES";
+
+/// Port used only to turn a hostname into something resolvable, and to probe
+/// whether an address belongs to the device; the address is what matters.
+const PROBE_PORT: u16 = 0;
+
+/// Port paired with a hostname for resolution. Any port resolves the same name.
 const RESOLVE_PORT: u16 = 80;
 
-/// IPv4 ranges a proxied request must never reach.
+/// Ranges that always name this host, whatever interfaces it has.
 const BLOCKED_IPV4_CIDRS: &[(Ipv4Addr, u32)] = &[
-    (Ipv4Addr::new(0, 0, 0, 0), 8),       // this host / this network
-    (Ipv4Addr::new(10, 0, 0, 0), 8),      // private
-    (Ipv4Addr::new(100, 64, 0, 0), 10),   // carrier-grade NAT
-    (Ipv4Addr::new(127, 0, 0, 0), 8),     // loopback
-    (Ipv4Addr::new(169, 254, 0, 0), 16),  // link-local + cloud metadata
-    (Ipv4Addr::new(172, 16, 0, 0), 12),   // private
-    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments
-    (Ipv4Addr::new(192, 0, 2, 0), 24),    // TEST-NET-1
-    (Ipv4Addr::new(192, 88, 99, 0), 24),  // former 6to4 relay
-    (Ipv4Addr::new(192, 168, 0, 0), 16),  // private
-    (Ipv4Addr::new(198, 18, 0, 0), 15),   // benchmarking
-    (Ipv4Addr::new(198, 51, 100, 0), 24), // TEST-NET-2
-    (Ipv4Addr::new(203, 0, 113, 0), 24),  // TEST-NET-3
-    (Ipv4Addr::new(224, 0, 0, 0), 4),     // multicast and broadcast
-    (Ipv4Addr::new(240, 0, 0, 0), 4),     // reserved
+    (Ipv4Addr::new(0, 0, 0, 0), 8),   // this host / this network
+    (Ipv4Addr::new(127, 0, 0, 0), 8), // loopback
 ];
 
-/// IPv6 ranges a proxied request must never reach.
+/// IPv6 counterparts of the ranges above.
 const BLOCKED_IPV6_CIDRS: &[(Ipv6Addr, u32)] = &[
-    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64), // discard prefix
-    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32), // Teredo tunneling
-    (Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28), // ORCHIDv2
-    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
-    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16), // 6to4 (deprecated)
-    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation
-    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // SRv6
-    (Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96), // NAT64
-    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // NAT64
-    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // unique local
-    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10), // link-local
-    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8), // multicast
-    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128),    // unspecified
-    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128),    // loopback
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128), // unspecified
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128), // loopback
 ];
 
 fn matches_prefix(address: &[u8], network: &[u8], prefix_length: u32) -> bool {
@@ -73,20 +58,20 @@ fn matches_prefix(address: &[u8], network: &[u8], prefix_length: u32) -> bool {
     address[full_bytes] & mask == network[full_bytes] & mask
 }
 
-fn is_blocked_ipv4(address: Ipv4Addr) -> bool {
+fn is_loopback_ipv4(address: Ipv4Addr) -> bool {
     BLOCKED_IPV4_CIDRS.iter().any(|(network, prefix_length)| {
         matches_prefix(&address.octets(), &network.octets(), *prefix_length)
     })
 }
 
-fn is_blocked_ipv6(address: Ipv6Addr) -> bool {
+fn is_loopback_ipv6(address: Ipv6Addr) -> bool {
     // An IPv4-mapped ::ffff:a.b.c.d or the deprecated IPv4-compatible ::a.b.c.d
     // both carry in their low 32 bits the address that is actually connected to.
     if let Some(mapped) = address.to_ipv4_mapped() {
-        return is_blocked_ipv4(mapped);
+        return is_loopback_ipv4(mapped);
     }
     if let Some(compatible) = address.to_ipv4() {
-        return is_blocked_ipv4(compatible);
+        return is_loopback_ipv4(compatible);
     }
 
     BLOCKED_IPV6_CIDRS.iter().any(|(network, prefix_length)| {
@@ -94,20 +79,45 @@ fn is_blocked_ipv6(address: Ipv6Addr) -> bool {
     })
 }
 
-/// True when an address points somewhere a proxied request must never reach.
-pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
+/// True when an address names this host outright, before any interface is
+/// considered.
+fn is_loopback_address(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => is_blocked_ipv4(address),
-        IpAddr::V6(address) => is_blocked_ipv6(address),
+        IpAddr::V4(address) => is_loopback_ipv4(address),
+        IpAddr::V6(address) => is_loopback_ipv6(address),
     }
 }
 
+/// True when the device answers on this address.
+///
+/// Binding a socket to an address only succeeds when the address belongs to one
+/// of the local interfaces, which answers the question without enumerating them
+/// and without going stale when a lease changes. A kernel configured with
+/// `ip_nonlocal_bind` would let any address bind and make this always true, so
+/// the loopback ranges are checked separately rather than relying on this alone.
+fn is_device_address(address: IpAddr) -> bool {
+    let mapped = match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address => address,
+    };
+
+    UdpSocket::bind(SocketAddr::new(mapped, PROBE_PORT)).is_ok()
+}
+
+/// True when a proxied request must not reach this address: it is loopback, or
+/// it is one the device itself answers on.
+pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
+    is_loopback_address(address) || is_device_address(address)
+}
+
 /// Read once: the setting cannot change under a running proxy, and the check
-/// runs on every request and every redirect hop.
-fn blocking_private_addresses() -> bool {
+/// runs on every request and every name the client resolves.
+fn blocking_local_addresses() -> bool {
     static BLOCKING: OnceLock<bool> = OnceLock::new();
     *BLOCKING.get_or_init(|| {
-        std::env::var(BLOCK_PRIVATE_ADDRESSES_VAR)
+        std::env::var(BLOCK_LOCAL_ADDRESSES_VAR)
             .map(|value| value != "false")
             .unwrap_or(true)
     })
@@ -115,16 +125,16 @@ fn blocking_private_addresses() -> bool {
 
 /// Returns the reason a URL must not be fetched, or `None` when it may be.
 ///
-/// A literal address is decided without a lookup; a hostname is resolved and
-/// every address it answers with has to be public, so a name pointing at
-/// loopback is refused as well. A hostname that does not resolve is refused,
-/// because it cannot be vetted. The reason names the class of refusal and the
-/// URL, never the resolved address.
+/// A literal address is decided without a lookup; a hostname is resolved and no
+/// address it answers with may name the device, so a name pointing at loopback
+/// is refused as well. A hostname that does not resolve is refused, because it
+/// cannot be vetted. The reason names the class of refusal and the URL, never
+/// the resolved address.
 ///
 /// This resolves names with the blocking resolver, so callers on an async
 /// runtime should reach for [`blocked_url_reason_async`].
 pub(crate) fn blocked_url_reason(url: &url::Url) -> Option<String> {
-    blocked_url_reason_when(url, blocking_private_addresses())
+    blocked_url_reason_when(url, blocking_local_addresses())
 }
 
 fn blocked_url_reason_when(url: &url::Url, blocking: bool) -> Option<String> {
@@ -152,7 +162,7 @@ fn blocked_url_reason_when(url: &url::Url, blocking: bool) -> Option<String> {
     }
 
     if addresses.iter().copied().any(is_blocked_address) {
-        return Some(format!("Target resolves to a non-public address: {url}"));
+        return Some(format!("Target is an address of this device: {url}"));
     }
 
     None
@@ -166,6 +176,56 @@ pub(crate) async fn blocked_url_reason_async(url: url::Url) -> Option<String> {
         Err(_) => Some(String::from("Target could not be checked")),
     }
 }
+
+/// The resolver the HTTP client connects through, which refuses to hand back an
+/// address of this device.
+///
+/// Vetting a URL and then letting the client look the name up again leaves a
+/// window where the second answer differs from the checked one, which is all a
+/// rebinding host needs. Resolving here means the addresses that were vetted
+/// are exactly the addresses connected to, and it covers redirect hops too,
+/// since every connection the client makes comes through this resolver.
+pub(crate) struct PublicAddressResolver;
+
+impl reqwest::dns::Resolve for PublicAddressResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+
+        Box::pin(async move {
+            let blocking = blocking_local_addresses();
+            let resolved = tokio::task::spawn_blocking(move || {
+                (host.as_str(), RESOLVE_PORT)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>())
+            })
+            .await??;
+
+            if blocking
+                && resolved
+                    .iter()
+                    .any(|address| is_blocked_address(address.ip()))
+            {
+                error!("Refusing to resolve a host that names this device");
+                return Err(Box::new(DeviceAddress) as Box<dyn std::error::Error + Send + Sync>);
+            }
+
+            Ok(Box::new(resolved.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Returned when a name resolves to an address of this device. The message
+/// deliberately names no address.
+#[derive(Debug)]
+struct DeviceAddress;
+
+impl fmt::Display for DeviceAddress {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Target is an address of this device")
+    }
+}
+
+impl std::error::Error for DeviceAddress {}
 
 #[cfg(test)]
 mod tests {
@@ -186,53 +246,8 @@ mod tests {
     }
 
     #[test]
-    fn is_blocked_address_when_private_class_a_should_block() {
-        assert!(is_blocked_address("10.1.2.3".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_private_class_b_should_block() {
-        assert!(is_blocked_address("172.16.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_just_below_private_class_b_should_allow() {
-        assert!(!is_blocked_address("172.15.255.255".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_just_above_private_class_b_should_allow() {
-        assert!(!is_blocked_address("172.32.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_private_class_c_should_block() {
-        assert!(is_blocked_address("192.168.1.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_link_local_metadata_should_block() {
-        assert!(is_blocked_address("169.254.169.254".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_carrier_grade_nat_should_block() {
-        assert!(is_blocked_address("100.64.0.1".parse().unwrap()));
-    }
-
-    #[test]
     fn is_blocked_address_when_unspecified_should_block() {
         assert!(is_blocked_address("0.0.0.0".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_broadcast_should_block() {
-        assert!(is_blocked_address("255.255.255.255".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_public_should_allow() {
-        assert!(!is_blocked_address("93.184.216.34".parse().unwrap()));
     }
 
     #[test]
@@ -241,18 +256,29 @@ mod tests {
     }
 
     #[test]
-    fn is_blocked_address_when_ipv6_unique_local_should_block() {
-        assert!(is_blocked_address("fd00::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_ipv6_link_local_should_block() {
-        assert!(is_blocked_address("fe80::1".parse().unwrap()));
+    fn is_blocked_address_when_ipv6_unspecified_should_block() {
+        assert!(is_blocked_address("::".parse().unwrap()));
     }
 
     #[test]
     fn is_blocked_address_when_ipv4_mapped_loopback_should_block() {
         assert!(is_blocked_address("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_blocked_address_when_an_address_of_this_device_should_block() {
+        let device_address = UdpSocket::bind("127.0.0.1:0")
+            .expect("binding loopback should work")
+            .local_addr()
+            .expect("a bound socket has an address")
+            .ip();
+
+        assert!(is_blocked_address(device_address));
+    }
+
+    #[test]
+    fn is_blocked_address_when_public_should_allow() {
+        assert!(!is_blocked_address("93.184.216.34".parse().unwrap()));
     }
 
     #[test]
@@ -262,6 +288,18 @@ mod tests {
         ));
     }
 
+    // A player sits on a customer network and content there is fair game, so the
+    // private ranges must stay reachable.
+    #[test]
+    fn is_blocked_address_when_private_class_a_should_allow() {
+        assert!(!is_blocked_address("10.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_blocked_address_when_private_class_c_should_allow() {
+        assert!(!is_blocked_address("192.168.1.1".parse().unwrap()));
+    }
+
     #[test]
     fn blocked_url_reason_when_loopback_literal_should_refuse() {
         let reason = blocked_url_reason_when(&parse("http://127.0.0.1:4040/api/v3/screens/"), true);
@@ -269,19 +307,7 @@ mod tests {
         assert_eq!(
             reason,
             Some(String::from(
-                "Target resolves to a non-public address: http://127.0.0.1:4040/api/v3/screens/"
-            ))
-        );
-    }
-
-    #[test]
-    fn blocked_url_reason_when_private_literal_should_refuse() {
-        let reason = blocked_url_reason_when(&parse("http://192.168.1.10/"), true);
-
-        assert_eq!(
-            reason,
-            Some(String::from(
-                "Target resolves to a non-public address: http://192.168.1.10/"
+                "Target is an address of this device: http://127.0.0.1:4040/api/v3/screens/"
             ))
         );
     }
@@ -293,7 +319,7 @@ mod tests {
         assert_eq!(
             reason,
             Some(String::from(
-                "Target resolves to a non-public address: http://[::1]:3030/"
+                "Target is an address of this device: http://[::1]:3030/"
             ))
         );
     }

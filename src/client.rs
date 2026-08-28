@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use log::{error, trace};
 use reqwest::{redirect, Client};
 use warp::http::request::Parts;
@@ -20,8 +22,8 @@ const MAX_REDIRECTS: usize = 10;
 impl HttpsClient {
     pub(crate) fn new() -> Self {
         // Checking only the URL the caller asked for would leave a public host
-        // free to redirect the proxy to a loopback or private address, so every
-        // hop is vetted as reqwest follows it. The check runs on the thread
+        // free to redirect the proxy back at this device, so every hop is
+        // vetted as reqwest follows it. The check runs on the thread
         // reqwest calls the policy from, which is why it is the blocking one.
         let redirect_policy = redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
@@ -38,6 +40,7 @@ impl HttpsClient {
         });
 
         let client = Client::builder()
+            .dns_resolver(Arc::new(ssrf::PublicAddressResolver))
             .redirect(redirect_policy)
             .build()
             .expect("HTTP client should build");
