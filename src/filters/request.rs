@@ -7,6 +7,7 @@ use warp::{header, Buf, Filter, Rejection, Stream};
 
 use crate::error;
 use crate::filters;
+use crate::ssrf;
 
 pub(crate) fn proxied_request(
     host: String,
@@ -27,6 +28,11 @@ async fn create_request(
     body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + 'static,
     host: String,
 ) -> Result<Request<Body>, Rejection> {
+    if let Some(reason) = ssrf::blocked_url_reason_async(url.clone()).await {
+        error!("Refusing to proxy request: {}", reason);
+        return Err(warp::reject::custom(error::Error::BlockedTarget(reason)));
+    }
+
     if let Some(connection_header) = headers.remove(CONNECTION) {
         let headers_to_remove: Vec<&str> = connection_header
             .to_str()

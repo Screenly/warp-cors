@@ -6,6 +6,7 @@ mod error;
 mod filters;
 mod handlers;
 mod routes;
+mod ssrf;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

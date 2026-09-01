@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use log::trace;
-use reqwest::Client;
+use reqwest::{redirect, Client};
 use warp::http::request::Parts;
 use warp::hyper::{self, Body, Response};
 
 use crate::error;
+use crate::ssrf;
 
 pub type Request = hyper::Request<Body>;
 
@@ -14,7 +17,19 @@ pub(crate) struct HttpsClient {
 
 impl HttpsClient {
     pub(crate) fn new() -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            // Following a redirect would let a public host bounce the proxy at
+            // this device on a hop the caller never named. The 3xx goes back to
+            // the caller instead, for the browser to follow under its own rules.
+            .redirect(redirect::Policy::none())
+            // A proxy taken from the environment would resolve the target name
+            // itself, at the far end, where nothing vets what it resolves to.
+            // Nothing configures one for this process, and this keeps it that
+            // way.
+            .no_proxy()
+            .dns_resolver(Arc::new(ssrf::PublicAddressResolver))
+            .build()
+            .expect("HTTP client should build");
         HttpsClient { client }
     }
 
@@ -38,7 +53,11 @@ impl HttpsClient {
             .build()?;
 
         trace!("Sending request");
-        let response = self.client.execute(request).await?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(error::from_client_error)?;
         trace!("Got response");
 
         let response_headers = response
