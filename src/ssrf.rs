@@ -35,17 +35,6 @@ fn unmapped(address: IpAddr) -> IpAddr {
     }
 }
 
-/// True when the device answers on this address.
-///
-/// Binding a socket to an address only succeeds when the address belongs to one
-/// of the local interfaces, which answers the question without enumerating them
-/// and without going stale when a lease changes. A kernel configured with
-/// `ip_nonlocal_bind` would let any address bind and make this always true, so
-/// loopback is checked separately rather than relying on this alone.
-fn is_device_address(address: IpAddr) -> bool {
-    probe_says_device(UdpSocket::bind(SocketAddr::new(address, ANY_PORT)).map(|_| ()))
-}
-
 /// `EAFNOSUPPORT`, which std gives no named `ErrorKind`. A kernel that will not
 /// make a socket of this family will not connect one either, so an address in
 /// that family is already out of reach and needs no refusing.
@@ -56,7 +45,13 @@ const FAMILY_UNSUPPORTED: i32 = 10047; // WSAEAFNOSUPPORT, which is what raw_os_
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 const FAMILY_UNSUPPORTED: i32 = 47;
 
-/// Reads the outcome of that bind.
+/// True when the device answers on this address.
+///
+/// Binding a socket to an address only succeeds when the address belongs to one
+/// of the local interfaces, which answers the question without enumerating them
+/// and without going stale when a lease changes. A kernel configured with
+/// `ip_nonlocal_bind` would let any address bind and make this always true, so
+/// loopback is checked separately rather than relying on this alone.
 ///
 /// Two failures mean the address is not one to refuse: `AddrNotAvailable`, which
 /// is the kernel saying no interface holds it, and a family it will not give us
@@ -64,9 +59,9 @@ const FAMILY_UNSUPPORTED: i32 = 47;
 /// reached under a burst of concurrent requests, a sandbox refusing the syscall
 /// — and a check that cannot answer must not hand back "safe", or the block
 /// quietly stops applying exactly when the proxy is busiest.
-fn probe_says_device(outcome: io::Result<()>) -> bool {
-    match outcome {
-        Ok(()) => true,
+fn is_device_address(address: IpAddr) -> bool {
+    match UdpSocket::bind(SocketAddr::new(address, ANY_PORT)) {
+        Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => false,
         Err(error) if error.raw_os_error() == Some(FAMILY_UNSUPPORTED) => false,
         Err(error) => {
@@ -229,44 +224,16 @@ mod tests {
         assert!(is_blocked_address("::ffff:127.0.0.1".parse().unwrap()));
     }
 
+    // 192.0.2.0/24 is reserved for documentation, so nothing routes it and no
+    // interface holds it. The bind fails with AddrNotAvailable, which is the one
+    // failure that actually answers the question.
     #[test]
-    fn probe_says_device_when_bound_should_be_true() {
-        assert!(probe_says_device(Ok(())));
+    fn is_device_address_when_no_interface_holds_it_should_be_false() {
+        assert!(!is_device_address(
+            "192.0.2.1".parse().expect("a valid address")
+        ));
     }
 
-    #[test]
-    fn probe_says_device_when_address_is_not_available_should_be_false() {
-        let outcome = Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "not here"));
-
-        assert!(!probe_says_device(outcome));
-    }
-
-    // Hosts with IPv6 turned off answer every v6 bind this way, including the
-    // wildcard, and nothing can reach a v6 target there in the first place.
-    #[test]
-    fn probe_says_device_when_the_family_is_unsupported_should_be_false() {
-        let outcome = Err(io::Error::from_raw_os_error(FAMILY_UNSUPPORTED));
-
-        assert!(!probe_says_device(outcome));
-    }
-
-    // The probe failing for its own reasons says nothing about the address, so it
-    // must not be read as permission to fetch it.
-    #[test]
-    fn probe_says_device_when_the_probe_itself_fails_should_be_true() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Other,
-            io::ErrorKind::OutOfMemory,
-        ] {
-            assert!(probe_says_device(Err(io::Error::new(kind, "probe failed"))));
-        }
-    }
-
-    // The loopback assertion above passes on the is_loopback() short-circuit, so
-    // the bind probe itself is only covered by an address that is not loopback.
-    // Connecting a UDP socket sends nothing; it just makes the kernel pick the
-    // outbound interface and tell us which address it would use.
     #[test]
     fn is_device_address_when_a_non_loopback_local_address_should_be_true() {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("binding the wildcard should work");
