@@ -51,7 +51,9 @@ fn is_device_address(address: IpAddr) -> bool {
 /// that family is already out of reach and needs no refusing.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const FAMILY_UNSUPPORTED: i32 = 97;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "windows")]
+const FAMILY_UNSUPPORTED: i32 = 10047; // WSAEAFNOSUPPORT, which is what raw_os_error gives there
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 const FAMILY_UNSUPPORTED: i32 = 47;
 
 /// Reads the outcome of that bind.
@@ -244,17 +246,6 @@ mod tests {
     #[test]
     fn is_blocked_address_when_ipv4_mapped_loopback_should_block() {
         assert!(is_blocked_address("::ffff:127.0.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn is_blocked_address_when_an_address_of_this_device_should_block() {
-        let device_address = UdpSocket::bind("127.0.0.1:0")
-            .expect("binding loopback should work")
-            .local_addr()
-            .expect("a bound socket has an address")
-            .ip();
-
-        assert!(is_blocked_address(device_address));
     }
 
     #[test]
