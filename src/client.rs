@@ -23,14 +23,16 @@ impl HttpsClient {
     pub(crate) fn new() -> Self {
         // Checking only the URL the caller asked for would leave a public host
         // free to redirect the proxy back at this device, so every hop is
-        // vetted as reqwest follows it. The check runs on the thread
-        // reqwest calls the policy from, which is why it is the blocking one.
+        // vetted as reqwest follows it. reqwest calls this policy on the thread
+        // driving the request, so it does no lookups: a hop naming an address
+        // is settled here, and a hop naming a host is settled by the resolver
+        // when the connection to it is made.
         let redirect_policy = redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error(error::Error::TooManyRedirects);
             }
 
-            match ssrf::blocked_url_reason(attempt.url()) {
+            match ssrf::blocked_url_reason_without_lookup(attempt.url()) {
                 Some(reason) => {
                     error!("Refusing to follow redirect: {}", reason);
                     attempt.error(error::Error::BlockedTarget(reason))
