@@ -42,6 +42,11 @@ impl HttpsClient {
         });
 
         let client = Client::builder()
+            // A proxy taken from the environment would resolve the target name
+            // itself, at the far end, where nothing vets what it resolves to.
+            // Nothing configures one for this process, and this keeps it that
+            // way.
+            .no_proxy()
             .dns_resolver(Arc::new(ssrf::PublicAddressResolver))
             .redirect(redirect_policy)
             .build()
