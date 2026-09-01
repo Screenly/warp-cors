@@ -169,7 +169,7 @@ impl reqwest::dns::Resolve for PublicAddressResolver {
 /// Returned when a name resolves to an address of this device. The message
 /// deliberately names no address.
 #[derive(Debug)]
-struct DeviceAddress;
+pub(crate) struct DeviceAddress;
 
 impl fmt::Display for DeviceAddress {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -67,7 +67,11 @@ impl HttpsClient {
             .build()?;
 
         trace!("Sending request");
-        let response = self.client.execute(request).await?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(error::from_client_error)?;
         trace!("Got response");
 
         let response_headers = response

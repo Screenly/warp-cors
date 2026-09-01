@@ -7,6 +7,8 @@ use warp::http;
 use warp::hyper;
 use warp::{Rejection, Reply};
 
+use crate::ssrf;
+
 #[derive(Serialize)]
 struct ErrorMessage {
     code: u16,
@@ -42,6 +44,40 @@ pub(crate) enum Error {
     Reqwest(reqwest::Error),
     TooManyRedirects,
     UrlParse(url::ParseError),
+}
+
+/// Turns a failure from the HTTP client into ours.
+///
+/// A refusal raised inside the client — by the redirect policy, or by the
+/// resolver when a second lookup names this device — comes back wrapped in a
+/// `reqwest::Error`. Taken at face value that is an `Error::Reqwest`, which
+/// answers 500 and drops the reason, so the two paths that exist precisely to
+/// catch a rebinding or redirecting host would report themselves as our own
+/// fault. Look through the wrapping and put the refusal back.
+pub(crate) fn from_client_error(err: reqwest::Error) -> Error {
+    refusal_in_chain(&err).unwrap_or(Error::Reqwest(err))
+}
+
+fn refusal_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<Error> {
+    let mut current = Some(err);
+
+    while let Some(err) = current {
+        match err.downcast_ref::<Error>() {
+            Some(Error::BlockedTarget(reason)) => {
+                return Some(Error::BlockedTarget(reason.clone()))
+            }
+            Some(Error::TooManyRedirects) => return Some(Error::TooManyRedirects),
+            _ => {}
+        }
+
+        if err.is::<ssrf::DeviceAddress>() {
+            return Some(Error::BlockedTarget(err.to_string()));
+        }
+
+        current = err.source();
+    }
+
+    None
 }
 
 impl Error {
@@ -114,3 +150,70 @@ impl warp::reject::Reject for Error {}
 //         warp::reject::custom(error)
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stands in for the layers reqwest puts between its own error and whatever
+    /// a policy or a resolver handed it.
+    #[derive(Debug)]
+    struct Wrapper(Box<dyn std::error::Error + Send + Sync>);
+
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    fn wrap(err: impl std::error::Error + Send + Sync + 'static) -> Wrapper {
+        Wrapper(Box::new(Wrapper(Box::new(err))))
+    }
+
+    #[test]
+    fn refusal_in_chain_when_a_blocked_target_is_buried_should_find_it() {
+        let err = wrap(Error::BlockedTarget(String::from(
+            "Target is an address of this device: http://127.0.0.1:4040/",
+        )));
+
+        let refusal = refusal_in_chain(&err).expect("the refusal should survive the wrapping");
+
+        assert_eq!(refusal.status_code(), 403);
+        assert_eq!(
+            refusal.to_string(),
+            "Target is an address of this device: http://127.0.0.1:4040/"
+        );
+    }
+
+    #[test]
+    fn refusal_in_chain_when_the_resolver_refused_should_be_a_blocked_target() {
+        let err = wrap(ssrf::DeviceAddress);
+
+        let refusal = refusal_in_chain(&err).expect("the refusal should survive the wrapping");
+
+        assert_eq!(refusal.status_code(), 403);
+        assert_eq!(refusal.to_string(), "Target is an address of this device");
+    }
+
+    #[test]
+    fn refusal_in_chain_when_the_redirect_depth_ran_out_should_keep_its_message() {
+        let err = wrap(Error::TooManyRedirects);
+
+        let refusal = refusal_in_chain(&err).expect("the refusal should survive the wrapping");
+
+        assert_eq!(refusal.to_string(), "Target redirected too many times");
+    }
+
+    #[test]
+    fn refusal_in_chain_when_nothing_refused_should_be_none() {
+        let err = wrap(io::Error::new(io::ErrorKind::ConnectionRefused, "nope"));
+
+        assert!(refusal_in_chain(&err).is_none());
+    }
+}
