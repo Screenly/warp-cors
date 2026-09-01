@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use log::{error, trace};
+use log::trace;
 use reqwest::{redirect, Client};
 use warp::http::request::Parts;
 use warp::hyper::{self, Body, Response};
@@ -15,40 +15,19 @@ pub(crate) struct HttpsClient {
     client: Client,
 }
 
-/// Matches reqwest's own default depth, kept explicit because the policy below
-/// replaces that default.
-const MAX_REDIRECTS: usize = 10;
-
 impl HttpsClient {
     pub(crate) fn new() -> Self {
-        // Checking only the URL the caller asked for would leave a public host
-        // free to redirect the proxy back at this device, so every hop is
-        // vetted as reqwest follows it. reqwest calls this policy on the thread
-        // driving the request, so it does no lookups: a hop naming an address
-        // is settled here, and a hop naming a host is settled by the resolver
-        // when the connection to it is made.
-        let redirect_policy = redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.error(error::Error::TooManyRedirects);
-            }
-
-            match ssrf::blocked_url_reason_without_lookup(attempt.url()) {
-                Some(reason) => {
-                    error!("Refusing to follow redirect: {}", reason);
-                    attempt.error(error::Error::BlockedTarget(reason))
-                }
-                None => attempt.follow(),
-            }
-        });
-
         let client = Client::builder()
+            // Following a redirect would let a public host bounce the proxy at
+            // this device on a hop the caller never named. The 3xx goes back to
+            // the caller instead, for the browser to follow under its own rules.
+            .redirect(redirect::Policy::none())
             // A proxy taken from the environment would resolve the target name
             // itself, at the far end, where nothing vets what it resolves to.
             // Nothing configures one for this process, and this keeps it that
             // way.
             .no_proxy()
             .dns_resolver(Arc::new(ssrf::PublicAddressResolver))
-            .redirect(redirect_policy)
             .build()
             .expect("HTTP client should build");
         HttpsClient { client }

@@ -87,30 +87,6 @@ pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
         || is_device_address(address)
 }
 
-/// The part of the check that costs nothing: the scheme, and a literal address.
-///
-/// A name is deliberately left alone here, because resolving it blocks the
-/// thread. [`PublicAddressResolver`] vets every address the client connects to,
-/// on the first hop and on every redirect after it, so a name is already
-/// covered by the time it matters.
-pub(crate) fn blocked_url_reason_without_lookup(url: &url::Url) -> Option<String> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Some(format!("Target scheme is not allowed: {url}"));
-    }
-
-    let blocked = match url.host()? {
-        url::Host::Ipv4(address) => is_blocked_address(IpAddr::V4(address)),
-        url::Host::Ipv6(address) => is_blocked_address(IpAddr::V6(address)),
-        url::Host::Domain(_) => false,
-    };
-
-    if blocked {
-        return Some(format!("Target is an address of this device: {url}"));
-    }
-
-    None
-}
-
 /// Returns the reason a URL must not be fetched, or `None` when it may be.
 ///
 /// A literal address is decided without a lookup; a hostname is resolved and no
@@ -122,13 +98,19 @@ pub(crate) fn blocked_url_reason_without_lookup(url: &url::Url) -> Option<String
 /// This resolves names with the blocking resolver, so callers on an async
 /// runtime should reach for [`blocked_url_reason_async`].
 pub(crate) fn blocked_url_reason(url: &url::Url) -> Option<String> {
-    if let Some(reason) = blocked_url_reason_without_lookup(url) {
-        return Some(reason);
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(format!("Target scheme is not allowed: {url}"));
     }
 
     let domain = match url.host()? {
+        url::Host::Ipv4(address) if is_blocked_address(IpAddr::V4(address)) => {
+            return Some(format!("Target is an address of this device: {url}"))
+        }
+        url::Host::Ipv6(address) if is_blocked_address(IpAddr::V6(address)) => {
+            return Some(format!("Target is an address of this device: {url}"))
+        }
         url::Host::Domain(domain) => domain,
-        // A literal was already decided, without a lookup.
+        // A literal address, and not one this device answers on.
         _ => return None,
     };
 
@@ -163,8 +145,7 @@ pub(crate) async fn blocked_url_reason_async(url: url::Url) -> Option<String> {
 /// Vetting a URL and then letting the client look the name up again leaves a
 /// window where the second answer differs from the checked one, which is all a
 /// rebinding host needs. Resolving here means the addresses that were vetted
-/// are exactly the addresses connected to, and it covers redirect hops too,
-/// since every connection the client makes comes through this resolver.
+/// are exactly the addresses connected to.
 pub(crate) struct PublicAddressResolver;
 
 impl reqwest::dns::Resolve for PublicAddressResolver {
@@ -366,40 +347,6 @@ mod tests {
             Some(String::from(
                 "Target scheme is not allowed: file:///etc/passwd"
             ))
-        );
-    }
-
-    #[test]
-    fn blocked_url_reason_without_lookup_when_loopback_literal_should_refuse() {
-        let reason = blocked_url_reason_without_lookup(&parse("http://127.0.0.1:4040/"));
-
-        assert_eq!(
-            reason,
-            Some(String::from(
-                "Target is an address of this device: http://127.0.0.1:4040/"
-            ))
-        );
-    }
-
-    #[test]
-    fn blocked_url_reason_without_lookup_when_scheme_is_not_http_should_refuse() {
-        let reason = blocked_url_reason_without_lookup(&parse("file:///etc/passwd"));
-
-        assert_eq!(
-            reason,
-            Some(String::from(
-                "Target scheme is not allowed: file:///etc/passwd"
-            ))
-        );
-    }
-
-    // Names are the resolver's job. Answering here would mean a lookup on the
-    // thread reqwest calls the redirect policy from.
-    #[test]
-    fn blocked_url_reason_without_lookup_when_a_name_should_defer() {
-        assert_eq!(
-            blocked_url_reason_without_lookup(&parse("http://localhost:4040/")),
-            None
         );
     }
 

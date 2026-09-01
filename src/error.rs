@@ -42,18 +42,17 @@ pub(crate) enum Error {
     InvalidHeaderValue(hyper::header::InvalidHeaderValue),
     Io(io::Error),
     Reqwest(reqwest::Error),
-    TooManyRedirects,
     UrlParse(url::ParseError),
 }
 
 /// Turns a failure from the HTTP client into ours.
 ///
-/// A refusal raised inside the client — by the redirect policy, or by the
-/// resolver when a second lookup names this device — comes back wrapped in a
+/// A refusal raised inside the client — by the resolver, when the lookup it
+/// makes for the connection names this device — comes back wrapped in a
 /// `reqwest::Error`. Taken at face value that is an `Error::Reqwest`, which
-/// answers 500 and drops the reason, so the two paths that exist precisely to
-/// catch a rebinding or redirecting host would report themselves as our own
-/// fault. Look through the wrapping and put the refusal back.
+/// answers 500 and drops the reason, so the path that exists precisely to catch
+/// a rebinding host would report itself as our own fault. Look through the
+/// wrapping and put the refusal back.
 pub(crate) fn from_client_error(err: reqwest::Error) -> Error {
     refusal_in_chain(&err).unwrap_or(Error::Reqwest(err))
 }
@@ -62,12 +61,8 @@ fn refusal_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<Error> {
     let mut current = Some(err);
 
     while let Some(err) = current {
-        match err.downcast_ref::<Error>() {
-            Some(Error::BlockedTarget(reason)) => {
-                return Some(Error::BlockedTarget(reason.clone()))
-            }
-            Some(Error::TooManyRedirects) => return Some(Error::TooManyRedirects),
-            _ => {}
+        if let Some(Error::BlockedTarget(reason)) = err.downcast_ref::<Error>() {
+            return Some(Error::BlockedTarget(reason.clone()));
         }
 
         if err.is::<ssrf::DeviceAddress>() {
@@ -101,7 +96,6 @@ impl fmt::Display for Error {
             Error::InvalidHeaderValue(err) => err.fmt(f),
             Error::Io(err) => err.fmt(f),
             Error::Reqwest(err) => err.fmt(f),
-            Error::TooManyRedirects => write!(f, "Target redirected too many times"),
             Error::UrlParse(err) => err.fmt(f),
         }
     }
@@ -199,15 +193,6 @@ mod tests {
 
         assert_eq!(refusal.status_code(), 403);
         assert_eq!(refusal.to_string(), "Target is an address of this device");
-    }
-
-    #[test]
-    fn refusal_in_chain_when_the_redirect_depth_ran_out_should_keep_its_message() {
-        let err = wrap(Error::TooManyRedirects);
-
-        let refusal = refusal_in_chain(&err).expect("the refusal should survive the wrapping");
-
-        assert_eq!(refusal.to_string(), "Target redirected too many times");
     }
 
     #[test]
