@@ -319,6 +319,11 @@ mod tests {
     }
 
     #[test]
+    fn is_blocked_address_when_ipv4_mapped_public_should_allow() {
+        assert!(!is_blocked_address("::ffff:93.184.216.34".parse().unwrap()));
+    }
+
+    #[test]
     fn is_blocked_address_when_ipv6_public_should_allow() {
         assert!(!is_blocked_address(
             "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
