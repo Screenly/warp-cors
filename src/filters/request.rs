@@ -28,9 +28,9 @@ async fn create_request(
     body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + 'static,
     host: String,
 ) -> Result<Request<Body>, Rejection> {
-    if let Some(reason) = ssrf::blocked_url_reason_async(url.clone()).await {
-        error!("Refusing to proxy request: {}", reason);
-        return Err(warp::reject::custom(error::Error::BlockedTarget(reason)));
+    if let Err(refusal) = ssrf::check_url_blocked(&url).await {
+        error!("Refusing to proxy request: {}", refusal);
+        return Err(warp::reject::custom(refusal));
     }
 
     if let Some(connection_header) = headers.remove(CONNECTION) {

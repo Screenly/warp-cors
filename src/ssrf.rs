@@ -15,9 +15,11 @@
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 use log::error;
+
+use crate::error::Error;
 
 /// Only the address matters here, never the port: it pairs with a hostname to
 /// resolve it, and with an address to probe whether the device owns it. It has
@@ -82,56 +84,58 @@ pub(crate) fn is_blocked_address(address: IpAddr) -> bool {
         || is_device_address(address)
 }
 
-/// Returns the reason a URL must not be fetched, or `None` when it may be.
+/// Refuses a URL that must not be fetched, naming the class of refusal and the
+/// URL but never the resolved address.
 ///
 /// A literal address is decided without a lookup; a hostname is resolved and no
 /// address it answers with may name the device, so a name pointing at loopback
 /// is refused as well. A hostname that does not resolve is refused, because it
-/// cannot be vetted. The reason names the class of refusal and the URL, never
-/// the resolved address.
-///
-/// This resolves names with the blocking resolver, so callers on an async
-/// runtime should reach for [`blocked_url_reason_async`].
-pub(crate) fn blocked_url_reason(url: &url::Url) -> Option<String> {
+/// cannot be vetted.
+pub(crate) async fn check_url_blocked(url: &url::Url) -> Result<(), Error> {
     if !matches!(url.scheme(), "http" | "https") {
-        return Some(format!("Target scheme is not allowed: {url}"));
+        return Err(Error::BlockedTarget(format!(
+            "Target scheme is not allowed: {url}"
+        )));
     }
 
-    let domain = match url.host()? {
-        url::Host::Ipv4(address) if is_blocked_address(IpAddr::V4(address)) => {
-            return Some(format!("Target is an address of this device: {url}"))
-        }
-        url::Host::Ipv6(address) if is_blocked_address(IpAddr::V6(address)) => {
-            return Some(format!("Target is an address of this device: {url}"))
-        }
-        url::Host::Domain(domain) => domain,
-        // A literal address, and not one this device answers on.
-        _ => return None,
+    let device_address = || {
+        Err(Error::BlockedTarget(format!(
+            "Target is an address of this device: {url}"
+        )))
     };
 
-    let addresses: Vec<IpAddr> = match (domain, ANY_PORT).to_socket_addrs() {
-        Ok(resolved) => resolved.map(|address| address.ip()).collect(),
-        Err(_) => return Some(format!("Target host does not resolve: {url}")),
+    let domain = match url.host() {
+        Some(url::Host::Ipv4(address)) if is_blocked_address(IpAddr::V4(address)) => {
+            return device_address()
+        }
+        Some(url::Host::Ipv6(address)) if is_blocked_address(IpAddr::V6(address)) => {
+            return device_address()
+        }
+        Some(url::Host::Domain(domain)) => domain,
+        // A literal address this device does not answer on, or no host at all.
+        _ => return Ok(()),
     };
 
-    if addresses.is_empty() {
-        return Some(format!("Target host does not resolve: {url}"));
+    let mut addresses = match tokio::net::lookup_host((domain, ANY_PORT)).await {
+        Ok(resolved) => resolved.peekable(),
+        Err(_) => {
+            return Err(Error::BlockedTarget(format!(
+                "Target host does not resolve: {url}"
+            )))
+        }
+    };
+
+    if addresses.peek().is_none() {
+        return Err(Error::BlockedTarget(format!(
+            "Target host does not resolve: {url}"
+        )));
     }
 
-    if addresses.iter().copied().any(is_blocked_address) {
-        return Some(format!("Target is an address of this device: {url}"));
+    if addresses.any(|address| is_blocked_address(address.ip())) {
+        return device_address();
     }
 
-    None
-}
-
-/// [`blocked_url_reason`] moved off the async runtime, since resolving a name
-/// blocks the thread it runs on.
-pub(crate) async fn blocked_url_reason_async(url: url::Url) -> Option<String> {
-    match tokio::task::spawn_blocking(move || blocked_url_reason(&url)).await {
-        Ok(reason) => reason,
-        Err(_) => Some(String::from("Target could not be checked")),
-    }
+    Ok(())
 }
 
 /// The resolver the HTTP client connects through, which refuses to hand back an
@@ -148,12 +152,9 @@ impl reqwest::dns::Resolve for PublicAddressResolver {
         let host = name.as_str().to_owned();
 
         Box::pin(async move {
-            let resolved = tokio::task::spawn_blocking(move || {
-                (host.as_str(), ANY_PORT)
-                    .to_socket_addrs()
-                    .map(|addresses| addresses.collect::<Vec<_>>())
-            })
-            .await??;
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), ANY_PORT))
+                .await?
+                .collect();
 
             if resolved
                 .iter()
@@ -281,71 +282,71 @@ mod tests {
         assert!(!is_blocked_address("192.168.1.1".parse().unwrap()));
     }
 
-    #[test]
-    fn blocked_url_reason_when_loopback_literal_should_refuse() {
-        let reason = blocked_url_reason(&parse("http://127.0.0.1:4040/api/v3/screens/"));
+    #[tokio::test]
+    async fn check_url_blocked_when_loopback_literal_should_refuse() {
+        let refusal = check_url_blocked(&parse("http://127.0.0.1:4040/api/v3/screens/"))
+            .await
+            .expect_err("this target must be refused");
 
         assert_eq!(
-            reason,
-            Some(String::from(
-                "Target is an address of this device: http://127.0.0.1:4040/api/v3/screens/"
-            ))
+            refusal.to_string(),
+            "Target is an address of this device: http://127.0.0.1:4040/api/v3/screens/"
         );
     }
 
-    #[test]
-    fn blocked_url_reason_when_ipv6_loopback_literal_should_refuse() {
-        let reason = blocked_url_reason(&parse("http://[::1]:3030/"));
+    #[tokio::test]
+    async fn check_url_blocked_when_ipv6_loopback_literal_should_refuse() {
+        let refusal = check_url_blocked(&parse("http://[::1]:3030/"))
+            .await
+            .expect_err("this target must be refused");
 
         assert_eq!(
-            reason,
-            Some(String::from(
-                "Target is an address of this device: http://[::1]:3030/"
-            ))
+            refusal.to_string(),
+            "Target is an address of this device: http://[::1]:3030/"
         );
     }
 
-    #[test]
-    fn blocked_url_reason_when_scheme_is_not_http_should_refuse() {
-        let reason = blocked_url_reason(&parse("file:///etc/passwd"));
+    #[tokio::test]
+    async fn check_url_blocked_when_scheme_is_not_http_should_refuse() {
+        let refusal = check_url_blocked(&parse("file:///etc/passwd"))
+            .await
+            .expect_err("this target must be refused");
 
         assert_eq!(
-            reason,
-            Some(String::from(
-                "Target scheme is not allowed: file:///etc/passwd"
-            ))
+            refusal.to_string(),
+            "Target scheme is not allowed: file:///etc/passwd"
         );
     }
 
-    #[test]
-    fn blocked_url_reason_when_public_literal_should_allow() {
-        let reason = blocked_url_reason(&parse("https://93.184.216.34/index.html"));
-
-        assert_eq!(reason, None);
+    #[tokio::test]
+    async fn check_url_blocked_when_public_literal_should_allow() {
+        check_url_blocked(&parse("https://93.184.216.34/index.html"))
+            .await
+            .expect("a public literal must be allowed");
     }
 
-    #[test]
-    fn blocked_url_reason_when_a_name_resolves_to_loopback_should_refuse() {
-        let reason = blocked_url_reason(&parse("http://localhost:4040/api/v3/screens/"));
+    #[tokio::test]
+    async fn check_url_blocked_when_a_name_resolves_to_loopback_should_refuse() {
+        let refusal = check_url_blocked(&parse("http://localhost:4040/api/v3/screens/"))
+            .await
+            .expect_err("this target must be refused");
 
         assert_eq!(
-            reason,
-            Some(String::from(
-                "Target is an address of this device: http://localhost:4040/api/v3/screens/"
-            ))
+            refusal.to_string(),
+            "Target is an address of this device: http://localhost:4040/api/v3/screens/"
         );
     }
 
     // .invalid is reserved precisely so it never resolves anywhere.
-    #[test]
-    fn blocked_url_reason_when_a_name_does_not_resolve_should_refuse() {
-        let reason = blocked_url_reason(&parse("http://player.invalid/api/"));
+    #[tokio::test]
+    async fn check_url_blocked_when_a_name_does_not_resolve_should_refuse() {
+        let refusal = check_url_blocked(&parse("http://player.invalid/api/"))
+            .await
+            .expect_err("this target must be refused");
 
         assert_eq!(
-            reason,
-            Some(String::from(
-                "Target host does not resolve: http://player.invalid/api/"
-            ))
+            refusal.to_string(),
+            "Target host does not resolve: http://player.invalid/api/"
         );
     }
 
