@@ -323,4 +323,42 @@ mod tests {
 
         assert_eq!(reason, None);
     }
+
+    #[test]
+    fn blocked_url_reason_when_a_name_resolves_to_loopback_should_refuse() {
+        let reason = blocked_url_reason(&parse("http://localhost:4040/api/v3/screens/"));
+
+        assert_eq!(
+            reason,
+            Some(String::from(
+                "Target is an address of this device: http://localhost:4040/api/v3/screens/"
+            ))
+        );
+    }
+
+    // .invalid is reserved precisely so it never resolves anywhere.
+    #[test]
+    fn blocked_url_reason_when_a_name_does_not_resolve_should_refuse() {
+        let reason = blocked_url_reason(&parse("http://player.invalid/api/"));
+
+        assert_eq!(
+            reason,
+            Some(String::from(
+                "Target host does not resolve: http://player.invalid/api/"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_when_the_name_is_this_device_should_refuse() {
+        use reqwest::dns::Resolve;
+
+        let name = "localhost".parse().expect("localhost is a valid name");
+        let refusal = match PublicAddressResolver.resolve(name).await {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("a name that answers with loopback must not resolve"),
+        };
+
+        assert_eq!(refusal.to_string(), "Target is an address of this device");
+    }
 }
