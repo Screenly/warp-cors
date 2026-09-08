@@ -39,8 +39,15 @@ Docker images are published in the
 repository.
 
 ```shell
-$ docker run -dp 3030:3030 bassetts/warp-cors
+$ docker run -d --network host bassetts/warp-cors
 ```
+
+Host networking is not a convenience here. warp-cors decides whether a target
+address belongs to the device by trying to bind it, and a container on the
+default bridge network sits in its own network namespace: the host's own
+addresses are unbindable there, so they look like someone else's and the proxy
+would happily fetch from services running beside it. In a bridge namespace
+(`-p 3030:3030`) the refusal only covers the container itself.
 
 ## Usage
 
